@@ -1,7 +1,9 @@
+use regex::Regex;
 use reqwest::Client;
+use serde_json::json;
 
 use crate::captions_extractor::CaptionsExtractor;
-use crate::errors::CouldNotRetrieveTranscript;
+use crate::errors::{CouldNotRetrieveTranscript, CouldNotRetrieveTranscriptReason};
 use crate::js_var_parser::JsVarParser;
 use crate::microformat_extractor::MicroformatExtractor;
 use crate::models::{MicroformatData, StreamingData, VideoDetails, VideoInfos};
@@ -10,6 +12,10 @@ use crate::streaming_data_extractor::StreamingDataExtractor;
 use crate::transcript_list::TranscriptList;
 use crate::video_details_extractor::VideoDetailsExtractor;
 use crate::youtube_page_fetcher::YoutubePageFetcher;
+
+const INNERTUBE_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?key={api_key}";
+const INNERTUBE_CLIENT_NAME: &str = "ANDROID";
+const INNERTUBE_CLIENT_VERSION: &str = "20.10.38";
 
 /// # VideoDataFetcher
 ///
@@ -113,11 +119,9 @@ impl VideoDataFetcher {
         &self,
         video_id: &str,
     ) -> Result<TranscriptList, CouldNotRetrieveTranscript> {
-        // Get player response with playability check
-        let player_response = self.fetch_player_response(video_id, true).await?;
-
-        // Extract captions data and build transcript list
-        let video_captions = CaptionsExtractor::extract_captions_data(&player_response, video_id)?;
+        // Mirror python implementation: fetch captions through InnerTube player API
+        // using the API key extracted from the watch page.
+        let video_captions = self.fetch_captions_from_innertube(video_id).await?;
 
         TranscriptList::build(video_id.to_string(), &video_captions)
     }
@@ -358,6 +362,100 @@ impl VideoDataFetcher {
         })
     }
 
+    /// Extracts the InnerTube API key from watch page HTML.
+    ///
+    /// Python implementation parity:
+    /// this key is read from the watch page and then used to call
+    /// `youtubei/v1/player?key=...` with the Android client context.
+    fn extract_innertube_api_key(
+        &self,
+        html: &str,
+        video_id: &str,
+    ) -> Result<String, CouldNotRetrieveTranscript> {
+        let pattern = Regex::new(r#"\"INNERTUBE_API_KEY\":\s*\"([a-zA-Z0-9_-]+)\""#)
+            .expect("valid API key regex");
+
+        if let Some(captures) = pattern.captures(html) {
+            if let Some(api_key) = captures.get(1) {
+                return Ok(api_key.as_str().to_string());
+            }
+        }
+
+        if html.contains("class=\"g-recaptcha\"") {
+            return Err(CouldNotRetrieveTranscript {
+                video_id: video_id.to_string(),
+                reason: Some(CouldNotRetrieveTranscriptReason::IpBlocked(None)),
+            });
+        }
+
+        Err(CouldNotRetrieveTranscript {
+            video_id: video_id.to_string(),
+            reason: Some(CouldNotRetrieveTranscriptReason::YouTubeDataUnparsable(
+                "Could not extract INNERTUBE_API_KEY from watch page HTML".to_string(),
+            )),
+        })
+    }
+
+    async fn fetch_innertube_player_response(
+        &self,
+        video_id: &str,
+        api_key: &str,
+    ) -> Result<serde_json::Value, CouldNotRetrieveTranscript> {
+        let response = self
+            .client
+            .post(INNERTUBE_API_URL.replace("{api_key}", api_key))
+            .json(&json!({
+                "context": {
+                    "client": {
+                        "clientName": INNERTUBE_CLIENT_NAME,
+                        "clientVersion": INNERTUBE_CLIENT_VERSION,
+                    }
+                },
+                "videoId": video_id,
+            }))
+            .send()
+            .await
+            .map_err(|e| CouldNotRetrieveTranscript {
+                video_id: video_id.to_string(),
+                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeRequestFailed(
+                    e.to_string(),
+                )),
+            })?;
+
+        if !response.status().is_success() {
+            return Err(CouldNotRetrieveTranscript {
+                video_id: video_id.to_string(),
+                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeRequestFailed(
+                    format!("YouTube returned status code: {}", response.status()),
+                )),
+            });
+        }
+
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| CouldNotRetrieveTranscript {
+                video_id: video_id.to_string(),
+                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeDataUnparsable(
+                    format!("Failed to parse InnerTube player response: {}", e),
+                )),
+            })
+    }
+
+    async fn fetch_captions_from_innertube(
+        &self,
+        video_id: &str,
+    ) -> Result<serde_json::Value, CouldNotRetrieveTranscript> {
+        let html = self.page_fetcher.fetch_video_page(video_id).await?;
+        let api_key = self.extract_innertube_api_key(&html, video_id)?;
+        let player_response = self
+            .fetch_innertube_player_response(video_id, &api_key)
+            .await?;
+
+        PlayabilityAsserter::assert_playability(&player_response, video_id)?;
+        CaptionsExtractor::extract_captions_data(&player_response, video_id)
+    }
+
     /// Extracts the ytInitialPlayerResponse JavaScript variable from YouTube's HTML.
     ///
     /// This variable contains detailed information about the video, including captions.
@@ -411,5 +509,38 @@ impl VideoDataFetcher {
         }
 
         Ok(player_response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_innertube_api_key_from_html() {
+        let fetcher = VideoDataFetcher::new(Client::new());
+        let html =
+            r#"<html><script>var cfg = {"INNERTUBE_API_KEY":"test_api_key_123"};</script></html>"#;
+
+        let api_key = fetcher
+            .extract_innertube_api_key(html, "video123")
+            .expect("expected to extract API key");
+
+        assert_eq!(api_key, "test_api_key_123");
+    }
+
+    #[test]
+    fn extract_innertube_api_key_returns_ip_blocked_for_recaptcha() {
+        let fetcher = VideoDataFetcher::new(Client::new());
+        let html = r#"<html><div class="g-recaptcha"></div></html>"#;
+
+        let err = fetcher
+            .extract_innertube_api_key(html, "video123")
+            .expect_err("expected API key extraction to fail");
+
+        assert!(matches!(
+            err.reason,
+            Some(CouldNotRetrieveTranscriptReason::IpBlocked(_))
+        ));
     }
 }

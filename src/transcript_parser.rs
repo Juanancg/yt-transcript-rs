@@ -5,27 +5,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
 use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
 use std::io::Cursor;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Transcript {
-    #[serde(rename = "text")]
-    texts: Vec<Text>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Text {
-    #[serde(rename = "@start")]
-    start: String,
-
-    #[serde(rename = "@dur")]
-    duration: String,
-
-    // Text content of the element
-    #[serde(rename = "$text")]
-    content: String,
-}
 
 /// # TranscriptParser
 ///

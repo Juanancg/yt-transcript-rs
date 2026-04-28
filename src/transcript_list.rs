@@ -85,6 +85,24 @@ impl TranscriptList {
         }
     }
 
+    /// Extracts human-readable text from YouTube label objects that can be either
+    /// `{ "simpleText": "..." }` or `{ "runs": [{ "text": "..." }] }`.
+    fn extract_text_value(value: &serde_json::Value) -> Option<String> {
+        value
+            .get("simpleText")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                value
+                    .get("runs")
+                    .and_then(|runs| runs.as_array())
+                    .and_then(|runs| runs.first())
+                    .and_then(|run| run.get("text"))
+                    .and_then(|text| text.as_str())
+                    .map(|s| s.to_string())
+            })
+    }
+
     /// Creates a TranscriptList from YouTube's caption JSON data.
     ///
     /// This method parses YouTube's internal caption data structure to extract:
@@ -144,11 +162,11 @@ impl TranscriptList {
         let translation_languages = translation_languages_json
             .iter()
             .filter_map(|lang| {
-                let language_name = lang.get("languageName")?.get("simpleText")?.as_str()?;
+                let language_name = Self::extract_text_value(lang.get("languageName")?)?;
                 let language_code = lang.get("languageCode")?.as_str()?;
 
                 Some(TranslationLanguage {
-                    language: language_name.to_string(),
+                    language: language_name,
                     language_code: language_code.to_string(),
                 })
             })
@@ -176,16 +194,12 @@ impl TranscriptList {
             };
 
             let base_url = match caption.get("baseUrl").and_then(|url| url.as_str()) {
-                Some(url) => url.to_string(),
+                Some(url) => url.replace("&fmt=srv3", ""),
                 None => continue,
             };
 
-            let name = match caption
-                .get("name")
-                .and_then(|n| n.get("simpleText"))
-                .and_then(|st| st.as_str())
-            {
-                Some(name) => name.to_string(),
+            let name = match caption.get("name").and_then(Self::extract_text_value) {
+                Some(name) => name,
                 None => continue,
             };
 
@@ -471,5 +485,125 @@ impl<'a> IntoIterator for &'a TranscriptList {
             .values()
             .map(id as _)
             .chain(self.generated_transcripts.values().map(id as _))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TranscriptList;
+    use serde_json::json;
+
+    #[test]
+    fn build_without_client_supports_runs_for_generated_transcripts() {
+        let video_page_html = json!({
+            "captionTracks": [
+                {
+                    "baseUrl": "https://www.youtube.com/api/timedtext?v=test&lang=en&fmt=srv3",
+                    "name": { "runs": [{ "text": "English (auto-generated)" }] },
+                    "languageCode": "en",
+                    "kind": "asr",
+                    "isTranslatable": true
+                }
+            ],
+            "translationLanguages": [
+                {
+                    "languageCode": "es",
+                    "languageName": { "runs": [{ "text": "Spanish" }] }
+                }
+            ]
+        });
+
+        let transcript_list =
+            TranscriptList::build_without_client("video123".to_string(), &video_page_html)
+                .expect("expected transcript list to build");
+
+        assert!(transcript_list.manually_created_transcripts.is_empty());
+        assert_eq!(transcript_list.generated_transcripts.len(), 1);
+
+        let generated = transcript_list
+            .generated_transcripts
+            .get("en")
+            .expect("expected generated english transcript");
+        assert!(generated.is_generated);
+        assert_eq!(generated.language, "English (auto-generated)");
+        assert_eq!(
+            generated.url,
+            "https://www.youtube.com/api/timedtext?v=test&lang=en"
+        );
+
+        let found = transcript_list
+            .find_transcript(&["en"])
+            .expect("expected to find generated transcript");
+        assert!(found.is_generated);
+
+        assert_eq!(transcript_list.translation_languages.len(), 1);
+        assert_eq!(transcript_list.translation_languages[0].language_code, "es");
+        assert_eq!(transcript_list.translation_languages[0].language, "Spanish");
+    }
+
+    #[test]
+    fn build_without_client_supports_simple_text_for_backward_compatibility() {
+        let video_page_html = json!({
+            "captionTracks": [
+                {
+                    "baseUrl": "https://www.youtube.com/api/timedtext?v=test&lang=en",
+                    "name": { "simpleText": "English" },
+                    "languageCode": "en",
+                    "isTranslatable": true
+                }
+            ],
+            "translationLanguages": [
+                {
+                    "languageCode": "fr",
+                    "languageName": { "simpleText": "French" }
+                }
+            ]
+        });
+
+        let transcript_list =
+            TranscriptList::build_without_client("video123".to_string(), &video_page_html)
+                .expect("expected transcript list to build");
+
+        assert_eq!(transcript_list.manually_created_transcripts.len(), 1);
+        assert!(transcript_list.generated_transcripts.is_empty());
+
+        let manual = transcript_list
+            .manually_created_transcripts
+            .get("en")
+            .expect("expected manual english transcript");
+        assert!(!manual.is_generated);
+        assert_eq!(manual.language, "English");
+
+        assert_eq!(transcript_list.translation_languages.len(), 1);
+        assert_eq!(transcript_list.translation_languages[0].language_code, "fr");
+        assert_eq!(transcript_list.translation_languages[0].language, "French");
+    }
+
+    #[test]
+    fn build_without_client_removes_fmt_srv3_from_url() {
+        let video_page_html = json!({
+            "captionTracks": [
+                {
+                    "baseUrl": "https://www.youtube.com/api/timedtext?v=test&lang=en&fmt=srv3",
+                    "name": { "simpleText": "English" },
+                    "languageCode": "en",
+                    "isTranslatable": false
+                }
+            ]
+        });
+
+        let transcript_list =
+            TranscriptList::build_without_client("video123".to_string(), &video_page_html)
+                .expect("expected transcript list to build");
+
+        let transcript = transcript_list
+            .manually_created_transcripts
+            .get("en")
+            .expect("expected english transcript");
+
+        assert_eq!(
+            transcript.url,
+            "https://www.youtube.com/api/timedtext?v=test&lang=en"
+        );
     }
 }

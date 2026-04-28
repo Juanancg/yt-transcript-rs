@@ -4,7 +4,6 @@ use std::fmt;
 
 use crate::errors::{CouldNotRetrieveTranscript, CouldNotRetrieveTranscriptReason};
 use crate::fetched_transcript::FetchedTranscript;
-use crate::innertube_client::InnerTubeClient;
 use crate::models::TranslationLanguage;
 use crate::transcript_parser::TranscriptParser;
 
@@ -143,9 +142,8 @@ impl Transcript {
 
     /// Fetches the actual transcript content from YouTube.
     ///
-    /// This method retrieves the transcript text and timing information from YouTube
-    /// using YouTube's internal InnerTube API, which provides reliable access to
-    /// transcript data even when YouTube updates their external API requirements.
+    /// This method retrieves transcript XML directly from the transcript URL that
+    /// was selected when building the transcript list (Python parity behavior).
     ///
     /// # Parameters
     ///
@@ -196,77 +194,9 @@ impl Transcript {
         client: &Client,
         preserve_formatting: bool,
     ) -> Result<FetchedTranscript, CouldNotRetrieveTranscript> {
-        // Use InnerTube API directly - this is now the only reliable method
-        let innertube_client = InnerTubeClient::new(client.clone());
+        let transcript_url = self.url.replace("&fmt=srv3", "");
 
-        // Get fresh transcript URLs from InnerTube API
-        let data = innertube_client
-            .get_transcript_list(&self.video_id)
-            .await
-            .map_err(|e| CouldNotRetrieveTranscript {
-                video_id: self.video_id.clone(),
-                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeRequestFailed(
-                    format!("InnerTube API failed: {}", e),
-                )),
-            })?;
-
-        // Extract caption tracks from the InnerTube response
-        let captions = data
-            .get("captions")
-            .ok_or_else(|| CouldNotRetrieveTranscript {
-                video_id: self.video_id.clone(),
-                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeDataUnparsable(
-                    "No captions found in InnerTube response".to_string(),
-                )),
-            })?;
-
-        let player_captions_renderer =
-            captions
-                .get("playerCaptionsTracklistRenderer")
-                .ok_or_else(|| CouldNotRetrieveTranscript {
-                    video_id: self.video_id.clone(),
-                    reason: Some(CouldNotRetrieveTranscriptReason::YouTubeDataUnparsable(
-                        "No playerCaptionsTracklistRenderer found".to_string(),
-                    )),
-                })?;
-
-        let caption_tracks = player_captions_renderer
-            .get("captionTracks")
-            .and_then(|ct| ct.as_array())
-            .ok_or_else(|| CouldNotRetrieveTranscript {
-                video_id: self.video_id.clone(),
-                reason: Some(CouldNotRetrieveTranscriptReason::YouTubeDataUnparsable(
-                    "No caption tracks found in InnerTube response".to_string(),
-                )),
-            })?;
-
-        // Find the matching transcript URL for our language
-        let mut matching_url = None;
-        for track in caption_tracks {
-            if let Some(language_code) = track.get("languageCode").and_then(|lc| lc.as_str()) {
-                if language_code == self.language_code {
-                    if let Some(base_url) = track.get("baseUrl").and_then(|url| url.as_str()) {
-                        matching_url = Some(base_url.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        let transcript_url = matching_url.ok_or_else(|| CouldNotRetrieveTranscript {
-            video_id: self.video_id.clone(),
-            reason: Some(CouldNotRetrieveTranscriptReason::NoTranscriptFound {
-                requested_language_codes: vec![self.language_code.clone()],
-                transcript_data: crate::transcript_list::TranscriptList::new(
-                    self.video_id.clone(),
-                    HashMap::new(),
-                    HashMap::new(),
-                    vec![],
-                ),
-            }),
-        })?;
-
-        // Fetch transcript content using the fresh URL from InnerTube
+        // Fetch transcript content from the selected transcript URL.
         let response =
             client
                 .get(&transcript_url)

@@ -171,11 +171,22 @@ impl PlayabilityAsserter {
                     .and_then(|s| s.as_str())
                     .unwrap_or("");
 
-                if reason.contains("Video unavailable") {
-                    Err(CouldNotRetrieveTranscript {
-                        video_id: video_id.to_string(),
-                        reason: Some(CouldNotRetrieveTranscriptReason::VideoUnavailable),
-                    })
+                let reason_lower = reason.to_ascii_lowercase();
+                let is_video_unavailable = reason_lower.contains("video unavailable")
+                    || reason_lower.contains("video is unavailable");
+
+                if is_video_unavailable {
+                    if video_id.starts_with("http://") || video_id.starts_with("https://") {
+                        Err(CouldNotRetrieveTranscript {
+                            video_id: video_id.to_string(),
+                            reason: Some(CouldNotRetrieveTranscriptReason::InvalidVideoId),
+                        })
+                    } else {
+                        Err(CouldNotRetrieveTranscript {
+                            video_id: video_id.to_string(),
+                            reason: Some(CouldNotRetrieveTranscriptReason::VideoUnavailable),
+                        })
+                    }
                 } else {
                     let mut sub_reasons = Vec::new();
 
@@ -335,6 +346,25 @@ mod tests {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.video_id, video_id);
+        assert!(matches!(
+            error.reason,
+            Some(CouldNotRetrieveTranscriptReason::VideoUnavailable)
+        ));
+    }
+
+    #[test]
+    fn test_unavailable_video_with_this_video_is_unavailable_reason() {
+        let video_id = "unavailable_video";
+        let player_data = json!({
+            "playabilityStatus": {
+                "status": "ERROR",
+                "reason": "This video is unavailable"
+            }
+        });
+
+        let result = PlayabilityAsserter::assert_playability(&player_data, video_id);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
         assert!(matches!(
             error.reason,
             Some(CouldNotRetrieveTranscriptReason::VideoUnavailable)
